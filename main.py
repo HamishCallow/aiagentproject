@@ -5,6 +5,11 @@ from google import genai
 from google.genai import types
 from config import system_prompt
 from functions.get_files_info import schema_get_files_info
+from functions.get_file_content import schema_get_file_content
+from functions.run_python_file import schema_run_python_file
+from functions.write_file import schema_write_file
+from functions.call_function import call_function
+import json
 
 load_dotenv()
 api_key = os.environ.get("GEMINI_API_KEY")
@@ -20,7 +25,7 @@ def main():
     ]
 
     available_functions = types.Tool(
-        function_declarations=[schema_get_files_info]
+        function_declarations=[schema_get_files_info, schema_get_file_content, schema_run_python_file, schema_write_file]
     )
 
     response = client.models.generate_content(
@@ -29,16 +34,48 @@ def main():
         config=types.GenerateContentConfig(
             tools=[available_functions],
             system_instruction=system_prompt,
+            temperature=0,
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode="ANY")
+            ),
         ),
     )
 
-    if response.function_calls:
-        for fc in response.function_calls:
-            print(f"Calling function: {fc.name}({fc.args})")
+    calls = []
+    if getattr(response, "function_calls", None):
+        calls = response.function_calls
+    elif response.candidates:
+        for cand in response.candidates:
+            if getattr(cand, "function_calls", None):
+                calls = cand.function_calls
+                break
+    
+    verbose = ("--verbose" in sys.argv[2:])
+
+    if calls:
+        for fc in calls:
+            function_call_result = call_function(fc, verbose)
+            
+            if not (getattr(function_call_result, "parts", None) and len(function_call_result.parts) > 0):
+                raise Exception("Fatal: call_function did not return expected 'parts' structure.")
+            
+            first_part = function_call_result.parts[0]
+
+            if not getattr(first_part, "function_response", None):
+                raise Exception("Fatal: call_function did not return expected 'function_response' structure.")
+            
+            function_response_obj = first_part.function_response
+            
+            if not getattr(function_response_obj, "response", None):
+                raise Exception("Fatal: call_function did not return expected 'response' structure.")
+            
+            final_response = function_response_obj.response
+
+            if verbose:
+                print(f"-> {final_response}")
     else:
         print(response.text or "[no text returned]")
 
-    verbose = ("--verbose" in sys.argv[2:])
     um = response.usage_metadata
 
     if verbose:
