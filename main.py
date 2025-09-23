@@ -10,6 +10,7 @@ from functions.run_python_file import schema_run_python_file
 from functions.write_file import schema_write_file
 from functions.call_function import call_function
 import json
+import time
 
 load_dotenv()
 api_key = os.environ.get("GEMINI_API_KEY")
@@ -28,64 +29,97 @@ def main():
         function_declarations=[schema_get_files_info, schema_get_file_content, schema_run_python_file, schema_write_file]
     )
 
-    response = client.models.generate_content(
-        model="gemini-1.5-flash-002",
-        contents=messages,
-        config=types.GenerateContentConfig(
-            tools=[available_functions],
-            system_instruction=system_prompt,
-            temperature=0,
-            tool_config=types.ToolConfig(
-                function_calling_config=types.FunctionCallingConfig(mode="ANY")
-            ),
-        ),
-    )
-
-    calls = []
-    if getattr(response, "function_calls", None):
-        calls = response.function_calls
-    elif response.candidates:
-        for cand in response.candidates:
-            if getattr(cand, "function_calls", None):
-                calls = cand.function_calls
-                break
-    
     verbose = ("--verbose" in sys.argv[2:])
 
-    if calls:
-        for fc in calls:
-            function_call_result = call_function(fc, verbose)
-            
-            if not (getattr(function_call_result, "parts", None) and len(function_call_result.parts) > 0):
-                raise Exception("Fatal: call_function did not return expected 'parts' structure.")
-            
-            first_part = function_call_result.parts[0]
+    count = 0
+    while count < 20:
+        try:
 
-            if not getattr(first_part, "function_response", None):
-                raise Exception("Fatal: call_function did not return expected 'function_response' structure.")
-            
-            function_response_obj = first_part.function_response
-            
-            if not getattr(function_response_obj, "response", None):
-                raise Exception("Fatal: call_function did not return expected 'response' structure.")
-            
-            final_response = function_response_obj.response
+            retries = 3
+            delay = 2
+            for attempt in range(retries + 1):
+                try:
+                    response = client.models.generate_content(
+                        model="gemini-1.5-flash-002",
+                        contents=messages,
+                        config=types.GenerateContentConfig(
+                            tools=[available_functions],
+                            system_instruction=system_prompt,
+                            temperature=0,
+                            tool_config=types.ToolConfig(
+                                function_calling_config=types.FunctionCallingConfig(mode="ANY")
+                            ),
+                        ),
+                    )
+                    break
+                except Exception as e:
+                    msg = str(e)
+                    if ("RESOURCE_EXHAUSTED" in msg or "UNAVAILABLE" in msg or " 503 " in msg) and attempt < retries:
+                        time.sleep(delay)
+                        delay *= 2
+                        continue
+                    raise
+
+            for cand in response.candidates:
+                messages.append(cand.content)
+
+            if response.text: print(response.text); break
+
+            calls = []
+            if getattr(response, "function_calls", None):
+                calls = response.function_calls
+            elif response.candidates:
+                for cand in response.candidates:
+                    if getattr(cand, "function_calls", None):
+                        calls = cand.function_calls
+                        break
+
+            if not calls:
+                break
+
+            if calls:
+                for fc in calls:
+                    print(f" - Calling function: {fc.name}")
+                    function_call_result = call_function(fc, verbose)
+                    
+                    if not (getattr(function_call_result, "parts", None) and len(function_call_result.parts) > 0):
+                        raise Exception("Fatal: call_function did not return expected 'parts' structure.")
+                    
+                    first_part = function_call_result.parts[0]
+
+                    if not getattr(first_part, "function_response", None):
+                        raise Exception("Fatal: call_function did not return expected 'function_response' structure.")
+                    
+                    function_response_obj = first_part.function_response
+                    
+                    if not getattr(function_response_obj, "response", None):
+                        raise Exception("Fatal: call_function did not return expected 'response' structure.")
+                    
+                    final_response = function_response_obj.response
+
+                    tool_msg = types.Content(role="user", parts=function_call_result.parts)
+                    messages.append(tool_msg)
+
+                    if verbose:
+                        print(f"-> {final_response}")
+
+
+            um = response.usage_metadata
 
             if verbose:
-                print(f"-> {final_response}")
-    else:
-        print(response.text or "[no text returned]")
+                print(f"User prompt: {user_prompt}")
+                print(f"Prompt tokens: {um.prompt_token_count}")
+                print(f"Response tokens: {um.candidates_token_count}")
 
-    um = response.usage_metadata
+            if verbose and response.candidates:
+                fr = response.candidates[0].finish_reason
+                print(f"Finish reason: {fr}")
 
-    if verbose:
-        print(f"User prompt: {user_prompt}")
-        print(f"Prompt tokens: {um.prompt_token_count}")
-        print(f"Response tokens: {um.candidates_token_count}")
-
-    if response.candidates:
-        fr = response.candidates[0].finish_reason
-        print(f"Finish reason: {fr}")
+            count += 1
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"Error: {e}")
+            break
 
 if __name__ == "__main__":
     main()
