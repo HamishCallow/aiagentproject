@@ -1,125 +1,92 @@
-import os
 import sys
-from dotenv import load_dotenv
+import os
 from google import genai
 from google.genai import types
-from config import system_prompt
-from functions.get_files_info import schema_get_files_info
-from functions.get_file_content import schema_get_file_content
-from functions.run_python_file import schema_run_python_file
-from functions.write_file import schema_write_file
-from functions.call_function import call_function
-import json
-import time
-
-load_dotenv()
-api_key = os.environ.get("GEMINI_API_KEY")
-client = genai.Client(api_key=api_key)
+from dotenv import load_dotenv
+from functions.call_function import call_function, available_functions
+from config import MAX_ITERS, system_prompt
 
 def main():
-    if len(sys.argv) < 2:
-        print("error: no prompt given"); sys.exit(1)
+    load_dotenv()
 
-    user_prompt = sys.argv[1]
+    verbose = "--verbose" in sys.argv
+    args = []
+    for arg in sys.argv[1:]:
+        if not arg.startswith("--"):
+            args.append(arg)
+
+    if not args:
+        print("AI Code Assistant")
+        print('\nUsage: python main.py "your prompt here" [--verbose]')
+        print('Example: python main.py "How do I fix the calculator?"')
+        sys.exit(1)
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    client = genai.Client(api_key=api_key)
+
+    user_prompt = " ".join(args)
+
+    if verbose:
+        print(f"User prompt: {user_prompt}\n")
+
     messages = [
         types.Content(role="user", parts=[types.Part(text=user_prompt)]),
     ]
 
-    available_functions = types.Tool(
-        function_declarations=[schema_get_files_info, schema_get_file_content, schema_run_python_file, schema_write_file]
-    )
+    iters = 0
+    while True:
+        iters += 1
+        if iters > MAX_ITERS:
+            print(f"Maximum iterations ({MAX_ITERS}) reached.")
+            sys.exit(1)
 
-    verbose = ("--verbose" in sys.argv[2:])
-
-    count = 0
-    while count < 20:
         try:
-
-            retries = 3
-            delay = 2
-            for attempt in range(retries + 1):
-                try:
-                    response = client.models.generate_content(
-                        model="gemini-1.5-flash-002",
-                        contents=messages,
-                        config=types.GenerateContentConfig(
-                            tools=[available_functions],
-                            system_instruction=system_prompt,
-                            temperature=0,
-                            tool_config=types.ToolConfig(
-                                function_calling_config=types.FunctionCallingConfig(mode="ANY")
-                            ),
-                        ),
-                    )
-                    break
-                except Exception as e:
-                    msg = str(e)
-                    if ("RESOURCE_EXHAUSTED" in msg or "UNAVAILABLE" in msg or " 503 " in msg) and attempt < retries:
-                        time.sleep(delay)
-                        delay *= 2
-                        continue
-                    raise
-
-            for cand in response.candidates:
-                messages.append(cand.content)
-
-            if response.text: print(response.text); break
-
-            calls = []
-            if getattr(response, "function_calls", None):
-                calls = response.function_calls
-            elif response.candidates:
-                for cand in response.candidates:
-                    if getattr(cand, "function_calls", None):
-                        calls = cand.function_calls
-                        break
-
-            if not calls:
+            final_response = generate_content(client, messages, verbose)
+            if final_response:
+                print("Final response:")
+                print(final_response)
                 break
-
-            if calls:
-                for fc in calls:
-                    print(f" - Calling function: {fc.name}")
-                    function_call_result = call_function(fc, verbose)
-                    
-                    if not (getattr(function_call_result, "parts", None) and len(function_call_result.parts) > 0):
-                        raise Exception("Fatal: call_function did not return expected 'parts' structure.")
-                    
-                    first_part = function_call_result.parts[0]
-
-                    if not getattr(first_part, "function_response", None):
-                        raise Exception("Fatal: call_function did not return expected 'function_response' structure.")
-                    
-                    function_response_obj = first_part.function_response
-                    
-                    if not getattr(function_response_obj, "response", None):
-                        raise Exception("Fatal: call_function did not return expected 'response' structure.")
-                    
-                    final_response = function_response_obj.response
-
-                    tool_msg = types.Content(role="user", parts=function_call_result.parts)
-                    messages.append(tool_msg)
-
-                    if verbose:
-                        print(f"-> {final_response}")
-
-
-            um = response.usage_metadata
-
-            if verbose:
-                print(f"User prompt: {user_prompt}")
-                print(f"Prompt tokens: {um.prompt_token_count}")
-                print(f"Response tokens: {um.candidates_token_count}")
-
-            if verbose and response.candidates:
-                fr = response.candidates[0].finish_reason
-                print(f"Finish reason: {fr}")
-
-            count += 1
-            time.sleep(0.5)
         except Exception as e:
-            print(f"Error: {e}")
-            break
+            print(f"Error in generate_content: {e}")
+
+
+def generate_content(client, messages, verbose):
+    response = client.models.generate_content(
+        model="gemini-2.0-flash-001",
+        contents=messages,
+        config=types.GenerateContentConfig(
+            tools=[available_functions], system_instruction=system_prompt
+        ),
+    )
+    if verbose:
+        print("Prompt tokens:", response.usage_metadata.prompt_token_count)
+        print("Response tokens:", response.usage_metadata.candidates_token_count)
+
+    if response.candidates:
+        for candidate in response.candidates:
+            function_call_content = candidate.content
+            messages.append(function_call_content)
+
+    if not response.function_calls:
+        return response.text
+
+    function_responses = []
+    for function_call_part in response.function_calls:
+        function_call_result = call_function(function_call_part, verbose)
+        if (
+            not function_call_result.parts
+            or not function_call_result.parts[0].function_response
+        ):
+            raise Exception("empty function call result")
+        if verbose:
+            print(f"-> {function_call_result.parts[0].function_response.response}")
+        function_responses.append(function_call_result.parts[0])
+
+    if not function_responses:
+        raise Exception("no function responses generated, exiting.")
+
+    messages.append(types.Content(role="user", parts=function_responses))
+
 
 if __name__ == "__main__":
     main()
